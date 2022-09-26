@@ -18,8 +18,14 @@ use rayon::{ThreadPool, ThreadPoolBuilder};
 //     utilities::{FromBytes, ToBytes, UniformRand},
 // };
 
-use snarkvm_dpc::{posw::PoSWCircuit, testnet2::Testnet2, BlockTemplate, Network, PoSWScheme};
+//use snarkvm_dpc::{posw::PoSWCircuit, testnet2::Testnet2, BlockTemplate, Network, PoSWScheme};
 use snarkvm_utilities::Uniform;
+
+use snarkvm::{
+    dpc::{testnet2::Testnet2, Network, PoSWCircuit, PoSWError, PoSWProof, BlockTemplate, PoSWScheme},
+    utilities::{FromBytes, ToBytes, UniformRand},
+};
+
 
 use snarkvm_algorithms::{MerkleParameters, CRH, SNARK};
 use tokio::{sync::mpsc, task};
@@ -75,21 +81,21 @@ impl Prover {
                 thread_pools.push(Arc::new(pool));
             }
             info!(
-                "Created {} prover thread pools with {} threads each",
+                "Created {} cpu-prover thread pools with {} threads each",
                 thread_pools.len(),
                 pool_threads
             );
         } else {
-            let total_jobs = cuda_jobs.unwrap_or(1) * cuda.clone().unwrap().len() as u8;
-            for index in 0..total_jobs {
+            // let total_jobs = cuda_jobs.unwrap_or(1) * cuda.clone().unwrap().len() as u8;
+            for index in 0..pool_count {
                 let pool = ThreadPoolBuilder::new()
                     .stack_size(8 * 1024 * 1024)
-                    .num_threads(2)
+                    .num_threads(pool_threads as usize)
                     .thread_name(move |idx| format!("ap-cuda-{}-{}", index, idx))
                     .build()?;
                 thread_pools.push(Arc::new(pool));
             }
-            info!("Created {} prover ThreadPools with 2 threads each", thread_pools.len(),);
+            info!("Created {} cuda-prover ThreadPools with {} threads each", thread_pools.len(), pool_threads);
         }
 
         let (sender, mut receiver) = mpsc::channel(1024);
@@ -233,8 +239,11 @@ impl Prover {
                 if let Some(cuda) = cuda {
                     let mut tp_num = 0;
                     let cuda_len = cuda.len();
+
+                    info!("threadpool len {}", thread_pools.len());
+
                     for gpu_index in cuda {
-                        info!("gpu_index {}, cuda {}", gpu_index, cuda_len);
+                        info!("gpu_index {}, cuda_len {}", gpu_index, cuda_len);
                         for job_index in 0..cuda_jobs.unwrap_or(1) {
                             info!("job_index {} cuda_jobs {}", job_index, cuda_jobs.unwrap());
                             let tp_index = gpu_index as usize * cuda_jobs.unwrap_or(1) as usize + job_index as usize;
@@ -256,18 +265,63 @@ impl Prover {
                                     let block_height = height;
                                     let tp = tp.clone();
                                     let tp_num = tp_num.clone();
+                                    let gpu_index = gpu_index.clone();
+                                    let job_index = job_index.clone();
                     
-                                    tokio::time::sleep(Duration::from_secs(3)).await;
+                                    // tokio::time::sleep(Duration::from_secs(3)).await;
                                     if let Ok(proof) = task::spawn_blocking(move || {
                                         tp.install(|| {
-                                            info!("Doing task on threadpool {} weight {}, cuda", tp_num, block_height,);
+                                            info!("Doing task on threadpool {} weight {} gpu_index {} job_index {}, cuda", tp_num, block_height, gpu_index, job_index);
+
+                                            let mut rng = thread_rng();
+    
+                                            // Construct the block template.
+                                            info!("Doing task on threadpool {} height {} gpu_index {} job_index {}, cuda   ---------   genesis_block", tp_num, block_height, gpu_index, job_index);
+                                            let block = Testnet2::genesis_block();
+                                            let block_template = BlockTemplate::new(
+                                                block.previous_block_hash(),
+                                                block.height(),
+                                                block.timestamp(),
+                                                block.difficulty_target(),
+                                                block.cumulative_weight(),
+                                                block.previous_ledger_root(),
+                                                block.transactions().clone(),
+                                                block
+                                                    .to_coinbase_transaction()
+                                                    .unwrap()
+                                                    .to_records()
+                                                    .next()
+                                                    .unwrap(),
+                                            );
+    
+                                            info!("Doing task on threadpool {} height {} gpu_index {} job_index {}, cuda   ---------   setup circuit", tp_num, block_height, gpu_index, job_index);
+                                            // Instantiate the circuit.
+                                            let mut circuit =
+                                            PoSWCircuit::<Testnet2>::new(&block_template, Uniform::rand(&mut rng)).unwrap();
+    
+                                            // Run one iteration of PoSW.
+                                            info!("Doing task on threadpool {} height {} gpu_index {} job_index {}, cuda   ---------   posw proof", tp_num, block_height, gpu_index, job_index);
+                                            let proof = Testnet2::posw()
+                                            .prove_once_unchecked(&mut circuit, &block_template, &terminator, &mut rng, gpu_index)
+                                            .unwrap();
+                                            // Check if the updated proof is valid.
+                                            // info!("Doing task on threadpool {} height {}, cpu   ---------   posw verify", tp_num, block_height,);
+                                            // if !Testnet2::posw().verify(
+                                            //     block_template.difficulty_target(),
+                                            //     &circuit.to_public_inputs(),
+                                            //     &proof,
+                                            // ) {
+                                            //     panic!("proof verification failed, contestant disqualified");
+                                            // }
+
+                                            info!("Doing task on threadpool {} height {} gpu_index {} job_index {}, cuda   ---------   prove finish", tp_num, block_height, gpu_index, job_index);
                                         });
                                         
                                         height
                                     })
                                     .await
                                     {
-                                        info!("Doing task on threadpool {} weight {}, cuda await", tp_num, block_height,);
+                                        info!("Doing task on threadpool {} weight {} gpu_index {} job_index {}, cuda await", tp_num, block_height, gpu_index, job_index);
                                         total_proofs.fetch_add(1, Ordering::SeqCst);
                                     }
                                 }
@@ -327,17 +381,17 @@ impl Prover {
                                         // Run one iteration of PoSW.
                                         info!("Doing task on threadpool {} height {}, cpu   ---------   posw proof", tp_num, block_height,);
                                         let proof = Testnet2::posw()
-                                        .prove_once_unchecked(&mut circuit, &terminator, &mut rng)
+                                        .prove_once_unchecked(&mut circuit, &block_template, &terminator, &mut rng, -1)
                                         .unwrap();
                                         // Check if the updated proof is valid.
-                                        info!("Doing task on threadpool {} height {}, cpu   ---------   posw verify", tp_num, block_height,);
-                                        if !Testnet2::posw().verify(
-                                            block_template.difficulty_target(),
-                                            &circuit.to_public_inputs(),
-                                            &proof,
-                                        ) {
-                                            panic!("proof verification failed, contestant disqualified");
-                                        }
+                                        // info!("Doing task on threadpool {} height {}, cpu   ---------   posw verify", tp_num, block_height,);
+                                        // if !Testnet2::posw().verify(
+                                        //     block_template.difficulty_target(),
+                                        //     &circuit.to_public_inputs(),
+                                        //     &proof,
+                                        // ) {
+                                        //     panic!("proof verification failed, contestant disqualified");
+                                        // }
 
                                         info!("Doing task on threadpool {} height {}, cpu   ---------   prove finish", tp_num, block_height,);
                                     });
